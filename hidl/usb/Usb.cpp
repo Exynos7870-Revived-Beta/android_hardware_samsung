@@ -472,6 +472,46 @@ bool canSwitchRoleHelper(const std::string &portName, PortRoleType /*type*/) {
  * object if required.
  */
 Status getPortStatusHelper(hidl_vec<PortStatus> *currentPortStatus_1_2, HALVersion version) {
+    DIR *typecdir = opendir(kTypecPath);
+    if (typecdir == NULL) {
+        // Non-Type-C (Micro-USB) port fallback
+        currentPortStatus_1_2->resize(1);
+        (*currentPortStatus_1_2)[0].status_1_1.status.portName = "otg_default";
+
+        std::string otgOnline;
+        bool isHost = false;
+        if (!readFile("/sys/class/power_supply/otg/online", &otgOnline) && otgOnline == "1") {
+            isHost = true;
+        }
+
+        if (isHost) {
+            (*currentPortStatus_1_2)[0].status_1_1.status.currentDataRole = PortDataRole::HOST;
+            (*currentPortStatus_1_2)[0].status_1_1.status.currentPowerRole = PortPowerRole::SOURCE;
+            (*currentPortStatus_1_2)[0].status_1_1.status.currentMode = V1_0::PortMode::DFP;
+            (*currentPortStatus_1_2)[0].status_1_1.currentMode = PortMode_1_1::DFP;
+        } else {
+            (*currentPortStatus_1_2)[0].status_1_1.status.currentDataRole = PortDataRole::DEVICE;
+            (*currentPortStatus_1_2)[0].status_1_1.status.currentPowerRole = PortPowerRole::SINK;
+            (*currentPortStatus_1_2)[0].status_1_1.status.currentMode = V1_0::PortMode::UFP;
+            (*currentPortStatus_1_2)[0].status_1_1.currentMode = PortMode_1_1::UFP;
+        }
+
+        (*currentPortStatus_1_2)[0].status_1_1.status.canChangeMode = false;
+        (*currentPortStatus_1_2)[0].status_1_1.status.canChangeDataRole = false;
+        (*currentPortStatus_1_2)[0].status_1_1.status.canChangePowerRole = false;
+
+        if (version == HALVersion::V1_0) {
+            (*currentPortStatus_1_2)[0].status_1_1.status.supportedModes = V1_0::PortMode::DFP;
+        } else {
+            (*currentPortStatus_1_2)[0].status_1_1.supportedModes = PortMode_1_1::UFP | PortMode_1_1::DFP;
+            (*currentPortStatus_1_2)[0].status_1_1.status.supportedModes = V1_0::PortMode::NONE;
+            (*currentPortStatus_1_2)[0].status_1_1.status.currentMode = V1_0::PortMode::NONE;
+        }
+
+        return Status::SUCCESS;
+    }
+    closedir(typecdir);
+
     std::unordered_map<std::string, bool> names;
     Status result = getTypeCPortNamesHelper(&names);
     int i = -1;
@@ -647,27 +687,32 @@ static void uevent_event(uint32_t /*epevents*/, struct data *payload) {
             pthread_mutex_unlock(&payload->usb->mPartnerLock);
         } else if (!strncmp(cp, "DEVTYPE=typec_", strlen("DEVTYPE=typec_")) ||
                    !strncmp(cp, "CCIC=WATER", strlen("CCIC=WATER")) ||
-                   !strncmp(cp, "CCIC=DRY", strlen("CCIC=DRY"))) {
+                   !strncmp(cp, "CCIC=DRY", strlen("CCIC=DRY")) ||
+                   !strncmp(cp, "POWER_SUPPLY_NAME=otg", strlen("POWER_SUPPLY_NAME=otg"))) {
             hidl_vec<PortStatus> currentPortStatus_1_2;
             queryVersionHelper(payload->usb, &currentPortStatus_1_2);
 
             // Role switch is not in progress and port is in disconnected state
-            if (!pthread_mutex_trylock(&payload->usb->mRoleSwitchLock)) {
-                for (unsigned long i = 0; i < currentPortStatus_1_2.size(); i++) {
-                    DIR *dp =
-                        opendir(std::string("/sys/class/typec/" +
-                                            std::string(currentPortStatus_1_2[i]
-                                                            .status_1_1.status.portName.c_str()) +
-                                            "-partner")
-                                    .c_str());
-                    if (dp == NULL) {
-                        // PortRole role = {.role = static_cast<uint32_t>(PortMode::UFP)};
-                        switchToDrp(currentPortStatus_1_2[i].status_1_1.status.portName);
-                    } else {
-                        closedir(dp);
+            DIR *typecdir = opendir(kTypecPath);
+            if (typecdir != NULL) {
+                closedir(typecdir);
+                if (!pthread_mutex_trylock(&payload->usb->mRoleSwitchLock)) {
+                    for (unsigned long i = 0; i < currentPortStatus_1_2.size(); i++) {
+                        DIR *dp =
+                            opendir(std::string("/sys/class/typec/" +
+                                                std::string(currentPortStatus_1_2[i]
+                                                                .status_1_1.status.portName.c_str()) +
+                                                "-partner")
+                                        .c_str());
+                        if (dp == NULL) {
+                            // PortRole role = {.role = static_cast<uint32_t>(PortMode::UFP)};
+                            switchToDrp(currentPortStatus_1_2[i].status_1_1.status.portName);
+                        } else {
+                            closedir(dp);
+                        }
                     }
+                    pthread_mutex_unlock(&payload->usb->mRoleSwitchLock);
                 }
-                pthread_mutex_unlock(&payload->usb->mRoleSwitchLock);
             }
             break;
         }
